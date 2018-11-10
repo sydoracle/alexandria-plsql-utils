@@ -58,6 +58,44 @@ begin
 end get_xml;
 
 
+function get_worksheets_list( p_xlsx in blob ) return t_xlsx_sheet_properties
+as
+    l_returnvalue       t_xlsx_sheet_properties;
+    l_xml               xmltype;
+begin
+    
+    /* 
+    
+    Purpose:      get an array of the worksheets in the workbook
+    
+    Remarks:       
+    
+    Who     Date        Description 
+    ------  ----------  -------------------------------- 
+    JMW     02.03.2016  Created 
+    
+    */ 
+    
+    l_xml := get_xml( p_xlsx, 'xl/workbook.xml' );
+    
+    select xml.r_id, xml.sheetid, xml.name
+        bulk collect into l_returnvalue
+      from xmltable( xmlnamespaces( default 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+                         'http://schemas.openxmlformats.org/officeDocument/2006/relationships' AS "r" ),
+                    '/workbook/sheets/sheet'
+                    passing l_xml
+                    columns
+                        r_id varchar2(255) path '@r:id',
+                        sheetid number path '@sheetId',
+                        name varchar2(31) path '@name' ) xml
+    where xml.r_id is not null
+    order by xml.sheetid;
+    
+    return l_returnvalue;
+    
+end get_worksheets_list;
+
+
 function get_docx_properties (p_docx in blob) return t_docx_properties
 as
   l_returnvalue t_docx_properties;
@@ -208,7 +246,9 @@ begin
   
     l_blob := zip_util_pkg.get_file (p_template, l_file_list(i));
     
-    if l_file_list(i) in ('word/document.xml', 'word/footer1.xml', 'xl/sharedStrings.xml') or (l_file_list(i) like 'ppt/slides/slide%.xml') then
+    if l_file_list(i) in ('word/document.xml', 'word/footer1.xml', 'xl/sharedStrings.xml')
+        or (l_file_list(i) like 'ppt/slides/slide%.xml')
+        or (l_file_list(i) like 'ppt/notesSlides/notesSlide%.xml') then
     
       l_clob := sql_util_pkg.blob_to_clob (l_blob);
       l_clob := string_util_pkg.multi_replace (l_clob, p_names, p_values);
@@ -268,63 +308,71 @@ begin
 end get_xlsx_properties;
 
 
-function get_xlsx_column_number (p_column_ref in varchar2) return number
+function get_xlsx_column_number( p_column_ref in varchar2 ) return number
 as
-  l_returnvalue number;
+    l_returnvalue       number;
+    l_char_num          number;
+    l_power             number;
+    l_factor            decimal;
 begin
 
-  /*
- 
-  Purpose:      get column number from column reference
- 
-  Remarks:      
- 
-  Who     Date        Description
-  ------  ----------  --------------------------------
-  MBR     11.07.2011  Created
- 
-  */
+    /*
 
-  if length(p_column_ref) > 1 then
-    l_returnvalue := ascii(substr(p_column_ref,1,1)) - 64;
-    l_returnvalue := l_returnvalue * 26;
-    l_returnvalue := l_returnvalue + (ascii(substr(p_column_ref,2,1)) - 64);
-  else
-    l_returnvalue := ascii(p_column_ref) - 64;
-  end if; 
-  
-  return l_returnvalue;
-  
+    Purpose:      get column number from column reference
+
+    Remarks:      
+
+    Who     Date        Description
+    ------  ----------  --------------------------------
+    MBR     11.07.2011  Created
+    JMW     29.11.2016  Modified to support columns up to the limit (currently XFD or 16384)
+
+    */
+
+    l_power := length( p_column_ref ) - 1;
+
+    for i in 1..length( p_column_ref ) loop
+        l_char_num := ascii( substr( p_column_ref, i, 1 ));
+        l_factor := ( l_char_num - 65 ) + 1;
+        l_returnvalue := ( l_factor * power( 26, l_power )) + NVL( l_returnvalue, 0 );
+        l_power := l_power - 1;
+    end loop;
+
+    return l_returnvalue;
+
 end get_xlsx_column_number;
 
 
-function get_xlsx_column_ref (p_column_number in varchar2) return varchar2
+function get_xlsx_column_ref( p_column_number in number ) return varchar2
 as
-  l_offset number;
-  l_returnvalue varchar2(2);
+    l_dividend      decimal;
+    l_modulo        decimal;
+    l_returnvalue   varchar2(3);
 begin
-  
-  /*
- 
-  Purpose:      get column reference from column number
- 
-  Remarks:      
- 
-  Who     Date        Description
-  ------  ----------  --------------------------------
-  MBR     11.07.2011  Created
- 
-  */
 
-  if p_column_number < 27 then
-    l_returnvalue := chr(p_column_number + 64);
-  else
-    l_offset := trunc(p_column_number/26);
-    l_returnvalue := chr(l_offset + 64);
-    l_returnvalue := l_returnvalue || chr(p_column_number - (l_offset * 26) + 64);
-  end if; 
-  
-  return l_returnvalue;
+    /*
+
+    Purpose:      get column reference from column number
+
+    Remarks:      
+
+    Who     Date        Description
+    ------  ----------  --------------------------------
+    MBR     11.07.2011  Created
+    JMW     29.11.2016  Modified to support columns up to the limit (currently XFD or 16384)
+                         and to fix the bug where the '@' is returned at multiples of 26
+
+    */
+
+    l_dividend := p_column_number;
+
+    while l_dividend > 0 loop
+        l_modulo := mod( l_dividend - 1, 26 );
+        l_returnvalue := to_char( chr( l_modulo + 65 )) || l_returnvalue;
+        l_dividend := (( l_dividend - l_modulo ) / 26 );
+    end loop;
+
+    return l_returnvalue;
 
 end get_xlsx_column_ref;
 
@@ -401,7 +449,7 @@ begin
   if l_type = 's' then
     l_string_index := to_number (l_returnvalue);
     l_xml := get_xml (p_xlsx, 'xl/sharedStrings.xml');
-    l_returnvalue := xml_util_pkg.extract_value (l_xml, '/sst/si[' || (l_string_index + 1) || ']/t/text()', g_namespace_xlsx_sharedstrings);
+    l_returnvalue := xml_util_pkg.extract_value (l_xml, '/sst/si[' || (l_string_index + 1) || ']//t/text()', g_namespace_xlsx_sharedstrings);
   end if;
 
   return l_returnvalue;
@@ -453,7 +501,7 @@ begin
   
     if l_type = 's' then
       l_string_index := to_number (l_returnvalue(i));
-      l_returnvalue(i) := xml_util_pkg.extract_value (l_shared_strings, '/sst/si[' || (l_string_index + 1) || ']/t/text()', g_namespace_xlsx_sharedstrings);
+      l_returnvalue(i) := xml_util_pkg.extract_value (l_shared_strings, '/sst/si[' || (l_string_index + 1) || ']//t/text()', g_namespace_xlsx_sharedstrings);
     end if;
     
   end loop;
@@ -839,6 +887,3 @@ end get_pptx_plaintext;
 
 end ooxml_util_pkg;
 /
- 
-
-
